@@ -1,13 +1,13 @@
 
 # -*- coding: utf-8 -*-
 """
-DXF → Sólido 3D y Volumen (robusto, sólido siempre, wireframe opcional, ejes XYZ)
+DXF → Sólido 3D y Volumen (robusto, sólido siempre, wireframe por defecto, ejes XYZ)
 
 - Carga DXF con ezdxf (3DFACE/POLYFACE/MESH via virtual_entities).
 - Dedup de vértices con tolerancia configurable.
 - Repara malla, split seguro (networkx/scipy), componente mayor.
 - Calcula volumen: nativo (watertight), voxel (aprox), convex hull (referencia).
-- Visualiza SIEMPRE el sólido (Mesh3d), permite superponer wireframe y muestra ejes XYZ.
+- Visualiza SIEMPRE el sólido (Mesh3d), permite superponer wireframe y ejes XYZ.
 - Sin selector de cámara XY/XZ/YZ (vista genérica por defecto).
 
 Autor original: Sebastián Zúñiga Leyton
@@ -15,7 +15,7 @@ Ajustes: M365 Copilot
 """
 
 import os, io, tempfile, traceback
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
@@ -75,7 +75,7 @@ def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol
 
     verts: List[Tuple[float,float,float]] = []
     faces: List[Tuple[int,int,int]] = []
-    vmap = {}  # key -> index (dedup)
+    vmap: Dict[Tuple[int,int,int], int] = {}  # key -> index (dedup)
 
     def add_vertex(v):
         q = max(float(dedup_tol), 1e-12)  # tolerancia en unidades DXF
@@ -224,10 +224,23 @@ def split_components_safe(mesh: trimesh.Trimesh):
             return [mesh]
 
 def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[float]=None):
+    """
+    Devuelve volúmenes tanto en unidades nativas como en m³:
+      wt: bool
+      vol_native: volumen nativo (u³) si watertight, sino None
+      vol_m3: volumen en m³ si watertight, sino None
+      vol_voxel_native: volumen aproximado por voxel (u³) si no-watertight
+      vol_voxel_m3: volumen aproximado por voxel (m³) si no-watertight
+      hull_native: volumen de convex hull (u³)
+      hull_m3: volumen de convex hull (m³)
+    """
     wt = bool(mesh.is_watertight)
+
     vol_native = None
     vol_m3 = None
+    vol_voxel_native = None
     vol_voxel_m3 = None
+    hull_native = None
     hull_m3 = None
 
     try:
@@ -239,8 +252,10 @@ def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[
 
     try:
         hull_m3 = float(mesh.convex_hull.volume) * (to_meters**3)
+        hull_native = hull_m3 / (to_meters**3)
     except Exception:
         hull_m3 = None
+        hull_native = None
 
     if (not wt) and voxel_pitch and voxel_pitch > 0:
         try:
@@ -251,11 +266,20 @@ def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[
                 filled = int(np.count_nonzero(mat)) if mat is not None else None
             if filled is not None:
                 vol_voxel_m3 = float(filled) * float(voxel_pitch**3) * (to_meters**3)
+                vol_voxel_native = vol_voxel_m3 / (to_meters**3)
         except Exception:
+            vol_voxel_native = None
             vol_voxel_m3 = None
 
-    return {"wt": wt, "vol_native": vol_native, "vol_m3": vol_m3,
-            "vol_voxel_m3": vol_voxel_m3, "hull_m3": hull_m3}
+    return {
+        "wt": wt,
+        "vol_native": vol_native,
+        "vol_m3": vol_m3,
+        "vol_voxel_native": vol_voxel_native,
+        "vol_voxel_m3": vol_voxel_m3,
+        "hull_native": hull_native,
+        "hull_m3": hull_m3
+    }
 
 # ========= Visualización (sólido siempre, wireframe opcional, ejes XYZ) =========
 def render_mesh_scene(
@@ -263,7 +287,7 @@ def render_mesh_scene(
     title: str = "Sólido DXF",
     opacity: float = 0.85,
     show_axes: bool = True,
-    show_wireframe: bool = False,
+    show_wireframe: bool = True,    # ← por defecto ACTIVADO
     wire_max_segments: int = 20000
 ) -> go.Figure:
     V, F = mesh.vertices, mesh.faces
@@ -293,7 +317,7 @@ def render_mesh_scene(
         st.error("Error generando el sólido (Mesh3d).")
         st.code(traceback.format_exc())
 
-    # --- Wireframe opcional ---
+    # --- Wireframe opcional (superpuesto) ---
     if show_wireframe:
         try:
             edges = mesh.edges_unique
@@ -319,9 +343,14 @@ def render_mesh_scene(
             st.info("Wireframe no disponible para este modelo.")
             st.code(traceback.format_exc())
 
-    # --- Ejes XYZ opcionales ---
+    # --- Ejes XYZ opcionales (superpuestos) ---
     if show_axes and V.size:
-        extent = float(np.ptp(V, axis=0).max()) if V.size else 1.0
+        extent = float(np.ptp(V, axis=0).max())
+        # Fallback si el extento es muy pequeño (evita "desaparición" visual)
+        if not np.isfinite(extent) or extent <= 0:
+            bbox = np.linalg.norm(V.max(axis=0) - V.min(axis=0))
+            extent = float(bbox) if (bbox and bbox > 0) else 1.0
+
         fig.add_trace(go.Scatter3d(x=[0, extent], y=[0, 0], z=[0, 0], mode="lines",
                                    line=dict(color="red", width=3), name="Eje X", showlegend=False))
         fig.add_trace(go.Scatter3d(x=[0, 0], y=[0, extent], z=[0, 0], mode="lines",
@@ -357,7 +386,7 @@ with st.sidebar:
     target_faces = st.number_input("Caras objetivo visualización", min_value=1000, value=30000, step=1000)
     opacity = st.slider("Opacidad malla", 0.1, 1.0, 0.85, 0.05)
     show_axes = st.checkbox("Mostrar ejes XYZ", value=True)             # ejes visibles por defecto
-    show_wireframe = st.checkbox("Wireframe (superponer)", value=False)  # wireframe opcional
+    show_wireframe = st.checkbox("Wireframe (superponer)", value=True)  # wireframe ACTIVADO por defecto
 
 uploaded = st.file_uploader("Sube tu DXF", type=["dxf"])
 if not uploaded:
@@ -369,6 +398,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     with open(tmp_path, "wb") as f: f.write(uploaded.read())
 
     unit_name, to_meters = read_insunits(tmp_path, None if assume_units=="(auto)" else assume_units)
+    cubic = cubic_suffix(unit_name)
     st.write(f"**Unidades DXF:** `{unit_name}` (1 {unit_name} = {to_meters} m)")
 
     try:
@@ -390,28 +420,41 @@ with tempfile.TemporaryDirectory() as tmpdir:
     main = parts[0] if len(parts) else mesh
     st.write({"componentes": len(parts), "vertices_main": int(len(main.vertices)), "faces_main": int(len(main.faces))})
 
-    # Volúmenes
+    # Volúmenes (nativo y m³)
     vols = compute_volumes(main, to_meters, voxel_pitch=(voxel_pitch if voxel_pitch>0 else None))
-    cubic = cubic_suffix(unit_name)
 
+    # ========== Métricas superiores ==========
     colA,colB,colC,colD = st.columns(4)
     colA.metric("Vértices", f"{main.vertices.shape[0]:,}")
     colB.metric("Caras", f"{main.faces.shape[0]:,}")
-    colC.metric("Watertight", "Sí" if vols["wt"] else "No")  # ← CORREGIDO (if, no “si”)
-    colD.metric("Volumen (m³)" if vols["wt"] else "Aprox (voxel/convex) m³",
-                f"{(vols['vol_m3'] if vols['wt'] and vols['vol_m3'] is not None else (vols['vol_voxel_m3'] or vols['hull_m3'] or 0.0)):,.6f}")
+    colC.metric("Watertight", "Sí" if vols["wt"] else "No")
 
+    # Label dinámico y valor en UNIDADES NATIVAS
+    if vols["wt"] and vols["vol_native"] is not None:
+        metric_label = f"Volumen ({cubic})"
+        metric_value = vols["vol_native"]
+    else:
+        metric_label = f"Aprox ({cubic})"
+        metric_value = (vols["vol_voxel_native"] if vols["vol_voxel_native"] is not None
+                        else (vols["hull_native"] if vols["hull_native"] is not None else 0.0))
+    colD.metric(metric_label, f"{metric_value:,.6f}")
+
+    # ========== Resultados detallados ==========
     st.markdown("### Resultados")
     if vols["wt"] and vols["vol_native"] is not None:
         st.success(f"Volumen (nativo): `{vols['vol_native']:,.6f} {cubic}`")
         st.success(f"Volumen (m³): `{vols['vol_m3']:,.6f} m³`")
     else:
-        if vols["vol_voxel_m3"] is not None:
-            st.warning(f"Volumen aproximado por voxelización (m³): `{vols['vol_voxel_m3']:,.6f}` (malla abierta)")
-        if vols["hull_m3"] is not None:
-            st.info(f"Envolvente convexa (m³): `{vols['hull_m3']:,.6f}` (sobre-estima)")
+        if vols["vol_voxel_native"] is not None:
+            st.warning(f"Volumen aproximado por voxelización (nativo): `{vols['vol_voxel_native']:,.6f} {cubic}`")
+            if vols["vol_voxel_m3"] is not None:
+                st.info(f"Volumen aproximado por voxelización (m³): `{vols['vol_voxel_m3']:,.6f} m³`")
+        if vols["hull_native"] is not None:
+            st.info(f"Envolvente convexa (nativo): `{vols['hull_native']:,.6f} {cubic}`")
+            if vols["hull_m3"] is not None:
+                st.info(f"Envolvente convexa (m³): `{vols['hull_m3']:,.6f} m³`")
 
-    # Visualización: sólido siempre + wireframe/ejes según checkbox
+    # ========== Visualización 3D (sólido SIEMPRE) ==========
     st.markdown("### Visualización 3D")
     try:
         mesh_view = main.copy()
@@ -435,7 +478,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         st.error("Ocurrió un error al renderizar el sólido.")
         st.code(traceback.format_exc())
 
-    # Exportaciones
+    # ========== Exportaciones ==========
     st.markdown("### Exportar")
     stl_bytes = io.BytesIO()
     try:
@@ -453,9 +496,13 @@ with tempfile.TemporaryDirectory() as tmpdir:
         rep.write(f"Volumen nativo: {vols['vol_native']:.9f} {cubic}\n")
         rep.write(f"Volumen m3: {vols['vol_m3']:.9f} m^3\n")
     else:
-        if vols["vol_voxel_m3"] is not None:
-            rep.write(f"Volumen voxel (m3): {vols['vol_voxel_m3']:.9f}\n")
-        if vols["hull_m3"] is not None:
-            rep.write(f"Convex hull (m3): {vols['hull_m3']:.9f}\n")
+        if vols["vol_voxel_native"] is not None:
+            rep.write(f"Volumen voxel (nativo): {vols['vol_voxel_native']:.9f} {cubic}\n")
+            if vols["vol_voxel_m3"] is not None:
+                rep.write(f"Volumen voxel (m3): {vols['vol_voxel_m3']:.9f} m^3\n")
+        if vols["hull_native"] is not None:
+            rep.write(f"Convex hull (nativo): {vols['hull_native']:.9f} {cubic}\n")
+            if vols["hull_m3"] is not None:
+                rep.write(f"Convex hull (m3): {vols['hull_m3']:.9f} m^3\n")
     st.download_button("⬇️ Descargar Reporte TXT", rep.getvalue(),
                        os.path.splitext(uploaded.name)[0]+"_reporte_volumen.txt", "text/plain")
