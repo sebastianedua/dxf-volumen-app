@@ -352,4 +352,3 @@ if uploaded is not None:
             pass
 else:
     st.info("Carga un archivo DXF para comenzar.")
-``
