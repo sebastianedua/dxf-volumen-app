@@ -214,7 +214,7 @@ st.title("DXF → Sólido 3D y Volumen")
 
 st.markdown(
     "Sube un archivo **DXF** con entidades 3D (idealmente `3DFACE`). "
-    "La app convertirá a malla, intentará repararla, mostrará la vista 3D y calculará el volumen. Herramiemnta creada por Sebastián Zúñiga Leyton"
+    "La app convertirá a malla, intentará repararla, mostrará la vista 3D y calculará el volumen. Herramienta creada por Sebastián Zúñiga Leyton"
 )
 
 uploaded = st.file_uploader("Sube tu archivo DXF", type=["dxf"])
