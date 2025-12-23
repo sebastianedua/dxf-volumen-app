@@ -1,14 +1,14 @@
 
 # -*- coding: utf-8 -*-
 """
-DXF → Sólido 3D y Volumen (robusto, con visual unificada y manejo de errores)
+DXF → Sólido 3D y Volumen (robusto, sólido siempre, wireframe opcional, ejes XYZ)
 
 - Carga DXF con ezdxf (3DFACE/POLYFACE/MESH via virtual_entities).
 - Dedup de vértices con tolerancia configurable.
-- Repara malla, split seguro (networkx/scipy), selecciona componente mayor.
+- Repara malla, split seguro (networkx/scipy), componente mayor.
 - Calcula volumen: nativo (watertight), voxel (aprox), convex hull (referencia).
-- Visualiza SIEMPRE el sólido (Mesh3d), con wireframe/ejes en el mismo gráfico.
-- Manejo de errores y spinner para que no quede “pegado”.
+- Visualiza SIEMPRE el sólido (Mesh3d) y permite superponer wireframe; muestra ejes XYZ.
+- Sin selector de cámara XY/XZ/YZ.
 
 Autor original: Sebastián Zúñiga Leyton
 Ajustes: M365 Copilot
@@ -262,13 +262,12 @@ def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[
         "hull_m3": hull_m3
     }
 
-# ========= Visualización unificada (sólido + overlays) =========
+# ========= Visualización (sólido siempre, wireframe opcional, ejes XYZ) =========
 def render_mesh_scene(
     mesh: trimesh.Trimesh,
     title: str = "Sólido DXF",
     opacity: float = 0.85,
     show_axes: bool = True,
-    camera: str = "data",
     show_wireframe: bool = False,
     wire_max_segments: int = 20000
 ) -> go.Figure:
@@ -295,8 +294,7 @@ def render_mesh_scene(
                 lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2),
                 name="Hull (fallback)"
             ))
-    except Exception as e:
-        # Si falla el Mesh3d, mostramos el error y seguimos con lo que se pueda
+    except Exception:
         st.error("Error generando el sólido (Mesh3d).")
         st.code(traceback.format_exc())
 
@@ -318,8 +316,8 @@ def render_mesh_scene(
             zw[0::3] = zs[0::2]; zw[1::3] = zs[1::2]; zw[2::3] = np.nan
 
             fig.add_trace(go.Scatter3d(
-                x=xw.tolist(), y=yw.tolist(), z=zw.tolist(), mode="lines",
-                line=dict(color="gray", width=2),
+                x=xw.tolist(), y=yw.tolist(), z=zw.tolist(),
+                mode="lines", line=dict(color="gray", width=2),
                 name="Wireframe", showlegend=True
             ))
         except Exception:
@@ -336,21 +334,14 @@ def render_mesh_scene(
         fig.add_trace(go.Scatter3d(x=[0, 0], y=[0, 0], z=[0, extent], mode="lines",
                                    line=dict(color="blue", width=3), name="Eje Z", showlegend=False))
 
+    # --- Layout (sin selector de cámara: vista por defecto) ---
     fig.update_layout(
         title=title,
         scene=dict(aspectmode="data"),
         margin=dict(l=0, r=0, t=36, b=0),
-        legend=dict(orientation="h", yanchor="bottom", y=0.01, xanchor="right", x=0.99)
+        legend=dict(orientation="h", yanchor="bottom", y=0.01, xanchor="right", x=0.99),
+        scene_camera=dict(eye=dict(x=1.5, y=1.5, z=1.5))  # vista genérica
     )
-    if camera == 'xy':
-        fig.update_layout(scene_camera=dict(eye=dict(x=0., y=0., z=2.5)))
-    elif camera == 'xz':
-        fig.update_layout(scene_camera=dict(eye=dict(x=0., y=2.5, z=0.)))
-    elif camera == 'yz':
-        fig.update_layout(scene_camera=dict(eye=dict(x=2.5, y=0., z=0.)))
-    else:
-        fig.update_layout(scene_camera=dict(eye=dict(x=1.5, y=1.5, z=1.5)))
-
     return fig
 
 # ========= UI =========
@@ -370,9 +361,8 @@ with st.sidebar:
     simplify_for_view = st.checkbox("Simplificar solo para visualizar", value=True)
     target_faces = st.number_input("Caras objetivo visualización", min_value=1000, value=30000, step=1000)
     opacity = st.slider("Opacidad malla", 0.1, 1.0, 0.85, 0.05)
-    show_axes = st.checkbox("Mostrar ejes XYZ", value=True)
-    camera = st.selectbox("Cámara (vista)", ["data","xy","xz","yz"], index=0)
-    show_wireframe = st.checkbox("Wireframe (superponer)", value=False)
+    show_axes = st.checkbox("Mostrar ejes XYZ", value=True)         # ← ejes sí
+    show_wireframe = st.checkbox("Wireframe (superponer)", value=False)  # ← wireframe opcional
 
 uploaded = st.file_uploader("Sube tu DXF", type=["dxf"])
 if not uploaded:
@@ -403,16 +393,16 @@ with tempfile.TemporaryDirectory() as tmpdir:
     # Split seguro y componente principal
     parts = split_components_safe(mesh)
     main = parts[0] if len(parts) else mesh
-
     st.write({"componentes": len(parts), "vertices_main": int(len(main.vertices)), "faces_main": int(len(main.faces))})
 
+    # Volúmenes
     vols = compute_volumes(main, to_meters, voxel_pitch=(voxel_pitch if voxel_pitch>0 else None))
     cubic = cubic_suffix(unit_name)
 
     colA,colB,colC,colD = st.columns(4)
     colA.metric("Vértices", f"{main.vertices.shape[0]:,}")
     colB.metric("Caras", f"{main.faces.shape[0]:,}")
-    colC.metric("Watertight", "Sí" if vols["wt"] else "No")
+    colC.metric("Watertight", "Sí" si vols["wt"] else "No")
     colD.metric("Volumen (m³)" if vols["wt"] else "Aprox (voxel/convex) m³",
                 f"{(vols['vol_m3'] if vols['wt'] and vols['vol_m3'] is not None else (vols['vol_voxel_m3'] or vols['hull_m3'] or 0.0)):,.6f}")
 
@@ -426,7 +416,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         if vols["hull_m3"] is not None:
             st.info(f"Envolvente convexa (m³): `{vols['hull_m3']:,.6f}` (sobre-estima)")
 
-    # Visualización SIEMPRE con sólido (spinner + manejo de errores)
+    # Visualización: sólido siempre + wireframe/ejes según checkbox
     st.markdown("### Visualización 3D")
     try:
         mesh_view = main.copy()
@@ -437,18 +427,16 @@ with tempfile.TemporaryDirectory() as tmpdir:
             if mesh_view.faces.shape[0] == 0:
                 mesh_view = main.copy()
 
-        with st.spinner("Renderizando sólido en 3D…"):
-            fig = render_mesh_scene(
-                mesh_view,
-                title=os.path.basename(uploaded.name),
-                opacity=opacity,
-                show_axes=show_axes,
-                camera=camera,
-                show_wireframe=show_wireframe,
-                wire_max_segments=20000
-            )
+        fig = render_mesh_scene(
+            mesh_view,
+            title=os.path.basename(uploaded.name),
+            opacity=opacity,
+            show_axes=show_axes,
+            show_wireframe=show_wireframe,
+            wire_max_segments=20000
+        )
         st.plotly_chart(fig, use_container_width=True)
-    except Exception as e:
+    except Exception:
         st.error("Ocurrió un error al renderizar el sólido.")
         st.code(traceback.format_exc())
 
