@@ -1,20 +1,19 @@
 
 # -*- coding: utf-8 -*-
 """
-DXF → Sólido 3D y Volumen (robusto, con voxelización y visual mejorada)
+DXF → Sólido 3D y Volumen (robusto, con visual unificada)
 
 - Carga DXF con ezdxf (3DFACE/POLYFACE/MESH via virtual_entities).
 - Dedup de vértices con tolerancia configurable.
-- Repara malla, selecciona componente mayor, intenta cerrar agujeros.
+- Repara malla, selecciona componente mayor (split seguro), intenta cerrar agujeros.
 - Calcula volumen:
     * Nativo si watertight (confiable).
     * Aproximado por voxelización si no watertight (pitch configurable).
     * Envolvente convexa como referencia (sobre-estima).
-- Visualiza en 3D con Plotly (wireframe, opacidad, ejes, cámara).
+- Visualiza SIEMPRE el sólido (Mesh3d), con wireframe/ejes opcionales en el mismo gráfico.
 - Exporta STL y reporte TXT.
 
 Autor original: Sebastián Zúñiga Leyton
-Ajustes: M365 Copilot
 """
 
 import os, io, tempfile
@@ -82,12 +81,10 @@ def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol
 
     verts: List[Tuple[float,float,float]] = []
     faces: List[Tuple[int,int,int]] = []
-    # hash por grid snapping para agrupar cercanos
-    vmap = {}  # key -> index
+    vmap = {}  # key -> index (dedup)
 
     def add_vertex(v):
-        # tolerancia (en unidades DXF)
-        q = max(float(dedup_tol), 1e-12)
+        q = max(float(dedup_tol), 1e-12)  # tolerancia en unidades DXF
         k = (round(v.x/q), round(v.y/q), round(v.z/q))
         idx = vmap.get(k)
         if idx is None:
@@ -209,7 +206,7 @@ def load_mesh_from_dxf_robust(dxf_path:str, thickness:Optional[float], layer_reg
 
     raise ValueError("DXF no reconocido como malla ni perfiles 2D.")
 
-# ========= Repair / Volumen / Plot =========
+# ========= Repair / Split seguro / Volumen / Visual =========
 def repair_mesh(mesh:trimesh.Trimesh, weld_tol:Optional[float])->trimesh.Trimesh:
     # Merge de vértices cercano
     try:
@@ -235,19 +232,25 @@ def repair_mesh(mesh:trimesh.Trimesh, weld_tol:Optional[float])->trimesh.Trimesh
     try: trimesh.repair.fill_holes(mesh)
     except Exception: pass
 
-    # Seleccionar componente mayor para evitar fragmentos
-    try:
-        parts = mesh.split(only_watertight=False)
-        if len(parts) > 1:
-            parts = sorted(parts, key=lambda m: (len(m.faces), m.bounding_box_oriented.volume if m.vertices.size else 0), reverse=True)
-            mesh = parts[0]
-    except Exception:
-        pass
-
     try: mesh.process()
     except Exception: pass
 
     return mesh
+
+def split_components_safe(mesh: trimesh.Trimesh):
+    """
+    Devuelve [componentes] si el motor de grafos está disponible (networkx/scipy).
+    Si no, devuelve [mesh] para no romper la app.
+    """
+    try:
+        # Preferir networkx si está instalado
+        return mesh.split(only_watertight=False, engine='networkx')
+    except Exception:
+        try:
+            return mesh.split(only_watertight=False)
+        except Exception as e:
+            st.info(f"Split no disponible (falta networkx/scipy). Usando malla completa. Detalle: {e}")
+            return [mesh]
 
 def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[float]=None):
     wt = bool(mesh.is_watertight)
@@ -273,11 +276,9 @@ def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[
     # Voxelización (aprox para no-watertight)
     if (not wt) and voxel_pitch and voxel_pitch > 0:
         try:
-            vg = mesh.voxelized(voxel_pitch)  # VoxelGrid
-            # VoxelGrid no siempre expone .volume; estimamos por número de celdas llenas * pitch^3
+            vg = mesh.voxelized(voxel_pitch)
             filled = getattr(vg, 'filled_count', None)
             if filled is None:
-                # fallback: contar ocupación por matriz
                 mat = vg.matrix if hasattr(vg, 'matrix') else None
                 filled = int(np.count_nonzero(mat)) if mat is not None else None
             if filled is not None:
@@ -293,29 +294,82 @@ def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[
         "hull_m3": hull_m3
     }
 
-def plot_trimesh(mesh:trimesh.Trimesh, title="Sólido DXF", opacity=0.85, show_axes=True, camera='data')->go.Figure:
-    V,F=mesh.vertices, mesh.faces
-    fig = go.Figure([
-        go.Mesh3d(
-            x=V[:,0], y=V[:,1], z=V[:,2], i=F[:,0], j=F[:,1], k=F[:,2],
-            color="#4d88ff", opacity=float(opacity), flatshading=True,
-            lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2)
-        )
-    ])
-    if show_axes:
-        # Ejes simples en el origen
-        axes_len = float(np.ptp(V, axis=0).max()) if V.size else 1.0
-        ax = [
-            go.Scatter3d(x=[0, axes_len], y=[0,0], z=[0,0], mode="lines", line=dict(color="red", width=3), name="X"),
-            go.Scatter3d(x=[0,0], y=[0, axes_len], z=[0,0], mode="lines", line=dict(color="green", width=3), name="Y"),
-            go.Scatter3d(x=[0,0], y=[0,0], z=[0, axes_len], mode="lines", line=dict(color="blue", width=3), name="Z"),
-        ]
-        for a in ax: fig.add_trace(a)
+def render_mesh_scene(
+    mesh: trimesh.Trimesh,
+    title: str = "Sólido DXF",
+    opacity: float = 0.85,
+    show_axes: bool = True,
+    camera: str = "data",
+    show_wireframe: bool = False,
+    wire_max_segments: int = 20000
+) -> go.Figure:
+    """
+    Figura con:
+      - Sólido (Mesh3d) SIEMPRE.
+      - Wireframe opcional (Scatter3d) superpuesto.
+      - Ejes XYZ opcionales.
+    """
+    V, F = mesh.vertices, mesh.faces
+    fig = go.Figure()
 
+    # --- Sólido siempre ---
+    if F is not None and len(F) > 0:
+        fig.add_trace(go.Mesh3d(
+            x=V[:, 0], y=V[:, 1], z=V[:, 2],
+            i=F[:, 0], j=F[:, 1], k=F[:, 2],
+            color="#4d88ff", opacity=float(opacity), flatshading=True,
+            lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2),
+            name="Sólido"
+        ))
+    else:
+        hull = mesh.convex_hull
+        HV, HF = hull.vertices, hull.faces
+        fig.add_trace(go.Mesh3d(
+            x=HV[:, 0], y=HV[:, 1], z=HV[:, 2],
+            i=HF[:, 0], j=HF[:, 1], k=HF[:, 2],
+            color="#4d88ff", opacity=float(opacity), flatshading=True,
+            lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2),
+            name="Hull (fallback)"
+        ))
+
+    # --- Wireframe opcional ---
+    if show_wireframe:
+        edges = mesh.edges_unique
+        if wire_max_segments and len(edges) > wire_max_segments:
+            idx = np.random.choice(len(edges), size=wire_max_segments, replace=False)
+            edges = edges[idx]
+        segs = mesh.vertices[edges].reshape(-1, 2, 3)
+        xs = segs[:, :, 0].ravel(order="C")
+        ys = segs[:, :, 1].ravel(order="C")
+        zs = segs[:, :, 2].ravel(order="C")
+        n = len(segs)
+        xw = np.empty(n*3, dtype=float); yw = np.empty(n*3, dtype=float); zw = np.empty(n*3, dtype=float)
+        xw[0::3] = xs[0::2]; xw[1::3] = xs[1::2]; xw[2::3] = np.nan
+        yw[0::3] = ys[0::2]; yw[1::3] = ys[1::2]; yw[2::3] = np.nan
+        zw[0::3] = zs[0::2]; zw[1::3] = zs[1::2]; zw[2::3] = np.nan
+
+        fig.add_trace(go.Scatter3d(
+            x=xw, y=yw, z=zw, mode="lines",
+            line=dict(color="gray", width=2),
+            name="Wireframe", showlegend=True
+        ))
+
+    # --- Ejes XYZ opcionales ---
+    if show_axes:
+        extent = float(np.ptp(V, axis=0).max()) if V.size else 1.0
+        fig.add_trace(go.Scatter3d(x=[0, extent], y=[0, 0], z=[0, 0], mode="lines",
+                                   line=dict(color="red", width=3), name="Eje X", showlegend=False))
+        fig.add_trace(go.Scatter3d(x=[0, 0], y=[0, extent], z=[0, 0], mode="lines",
+                                   line=dict(color="green", width=3), name="Eje Y", showlegend=False))
+        fig.add_trace(go.Scatter3d(x=[0, 0], y=[0, 0], z=[0, extent], mode="lines",
+                                   line=dict(color="blue", width=3), name="Eje Z", showlegend=False))
+
+    # --- Layout y cámara ---
     fig.update_layout(
         title=title,
         scene=dict(aspectmode="data"),
-        margin=dict(l=0,r=0,t=36,b=0)
+        margin=dict(l=0, r=0, t=36, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=0.01, xanchor="right", x=0.99)
     )
     if camera == 'xy':
         fig.update_layout(scene_camera=dict(eye=dict(x=0., y=0., z=2.5)))
@@ -325,6 +379,7 @@ def plot_trimesh(mesh:trimesh.Trimesh, title="Sólido DXF", opacity=0.85, show_a
         fig.update_layout(scene_camera=dict(eye=dict(x=2.5, y=0., z=0.)))
     else:
         fig.update_layout(scene_camera=dict(eye=dict(x=1.5, y=1.5, z=1.5)))
+
     return fig
 
 # ========= UI =========
@@ -346,6 +401,7 @@ with st.sidebar:
     opacity = st.slider("Opacidad malla", 0.1, 1.0, 0.85, 0.05)
     show_axes = st.checkbox("Mostrar ejes XYZ", value=True)
     camera = st.selectbox("Cámara (vista)", ["data","xy","xz","yz"], index=0)
+    show_wireframe = st.checkbox("Wireframe (superponer)", value=False)
 
 uploaded = st.file_uploader("Sube tu DXF", type=["dxf"])
 if not uploaded:
@@ -356,6 +412,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     tmp_path = os.path.join(tmpdir, uploaded.name)
     with open(tmp_path, "wb") as f: f.write(uploaded.read())
 
+    # Unidades
     unit_name, to_meters = read_insunits(tmp_path, None if assume_units=="(auto)" else assume_units)
     st.write(f"**Unidades DXF:** `{unit_name}` (1 {unit_name} = {to_meters} m)")
 
@@ -374,8 +431,8 @@ with tempfile.TemporaryDirectory() as tmpdir:
     # Reparación
     mesh = repair_mesh(mesh, weld_tol=(weld_tol if weld_tol>0 else None))
 
-    # Métricas
-    parts = mesh.split(only_watertight=False)
+    # Componentes (split seguro) y selección del principal
+    parts = split_components_safe(mesh)
     main = parts[0] if len(parts) else mesh
     st.write({"componentes": len(parts), "vertices_main": int(len(main.vertices)), "faces_main": int(len(main.faces))})
 
@@ -400,28 +457,26 @@ with tempfile.TemporaryDirectory() as tmpdir:
         if vols["hull_m3"] is not None:
             st.info(f"Envolvente convexa (m³): `{vols['hull_m3']:,.6f}` (sobre-estima)")
 
-    # Visualización (opcionalmente simplificada)
+    # Visualización SIEMPRE con sólido + overlays en el mismo gráfico
+    st.info("Renderizando sólido en 3D…")
     mesh_view = main.copy()
     if simplify_for_view and mesh_view.faces.shape[0] > target_faces:
-        step = max(int(mesh_view.faces.shape[0]/target_faces), 1)
+        step = max(int(mesh_view.faces.shape[0] / target_faces), 1)
         mesh_view.update_faces(np.arange(0, mesh_view.faces.shape[0], step))
         mesh_view.remove_unreferenced_vertices()
+        if mesh_view.faces.shape[0] == 0:
+            mesh_view = main.copy()
 
-    # Wireframe opcional
-    fig = plot_trimesh(mesh_view, title=os.path.basename(uploaded.name), opacity=opacity, show_axes=show_axes, camera=camera)
+    fig = render_mesh_scene(
+        mesh_view,
+        title=os.path.basename(uploaded.name),
+        opacity=opacity,
+        show_axes=show_axes,
+        camera=camera,
+        show_wireframe=show_wireframe,
+        wire_max_segments=20000
+    )
     st.plotly_chart(fig, use_container_width=True)
-    if st.checkbox("Mostrar wireframe", value=False):
-        edges = mesh_view.edges_unique
-        ex = mesh_view.vertices[edges].reshape(-1, 2, 3)
-        fig_w = go.Figure([
-            go.Scatter3d(
-                x=seg[:,0], y=seg[:,1], z=seg[:,2],
-                mode="lines", line=dict(color="gray", width=1),
-                name="Wireframe", showlegend=False
-            ) for seg in ex
-        ])
-        fig_w.update_layout(scene=dict(aspectmode="data"), margin=dict(l=0,r=0,t=36,b=0), title="Wireframe")
-        st.plotly_chart(fig_w, use_container_width=True)
 
     # Exportaciones
     st.markdown("### Exportar")
