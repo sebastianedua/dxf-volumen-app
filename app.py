@@ -1,22 +1,20 @@
 
 # -*- coding: utf-8 -*-
 """
-DXF → Sólido 3D y Volumen (robusto, con visual unificada)
+DXF → Sólido 3D y Volumen (robusto, con visual unificada y manejo de errores)
 
 - Carga DXF con ezdxf (3DFACE/POLYFACE/MESH via virtual_entities).
 - Dedup de vértices con tolerancia configurable.
-- Repara malla, selecciona componente mayor (split seguro), intenta cerrar agujeros.
-- Calcula volumen:
-    * Nativo si watertight (confiable).
-    * Aproximado por voxelización si no watertight (pitch configurable).
-    * Envolvente convexa como referencia (sobre-estima).
-- Visualiza SIEMPRE el sólido (Mesh3d), con wireframe/ejes opcionales en el mismo gráfico.
-- Exporta STL y reporte TXT.
+- Repara malla, split seguro (networkx/scipy), selecciona componente mayor.
+- Calcula volumen: nativo (watertight), voxel (aprox), convex hull (referencia).
+- Visualiza SIEMPRE el sólido (Mesh3d), con wireframe/ejes en el mismo gráfico.
+- Manejo de errores y spinner para que no quede “pegado”.
 
 Autor original: Sebastián Zúñiga Leyton
+Ajustes: M365 Copilot
 """
 
-import os, io, tempfile
+import os, io, tempfile, traceback
 from typing import Optional, Tuple, List
 import numpy as np
 import streamlit as st
@@ -67,10 +65,6 @@ def read_insunits(dxf_path:str, assume_units:Optional[str])->Tuple[str,float]:
 
 # ========= Carga robusta desde DXF con ezdxf =========
 def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol:float=1e-6):
-    """
-    Devuelve listas (verts, faces) desde 3DFACE (y derivados) usando ezdxf.
-    Aplica virtual_entities() para desanidar INSERT/BLOCK. Dedup con tolerancia.
-    """
     import re
     doc = ezdxf.readfile(dxf_path)
     msp = doc.modelspace()
@@ -94,7 +88,6 @@ def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol
         return idx
 
     def add_triangle(a,b,c):
-        # descartar triángulos degenerados
         va=np.array(verts[a]); vb=np.array(verts[b]); vc=np.array(verts[c])
         if np.linalg.norm(np.cross(vb-va, vc-va)) < 1e-16:
             return
@@ -106,7 +99,6 @@ def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol
         except Exception:
             ws = [face.dxf.vtx0, face.dxf.vtx1, face.dxf.vtx2, face.dxf.vtx3]
         pts = [p for p in ws if p is not None]
-        # filtrar puntos consecutivos idénticos
         uniq = []
         for p in pts:
             if not uniq or (p != uniq[-1]):
@@ -130,7 +122,6 @@ def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol
             continue
 
         processed = False
-        # intentar virtual_entities
         try:
             for ve in e.virtual_entities():
                 if ve.dxftype() == "3DFACE":
@@ -141,7 +132,6 @@ def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol
         if processed:
             continue
 
-        # 3DFACE directo
         try:
             if e.dxftype() == "3DFACE":
                 handle_face3d(e)
@@ -149,7 +139,6 @@ def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol
         except Exception:
             pass
 
-        # Fallback: explotar a 3DFACE
         try:
             if e.dxftype() in ("POLYFACE", "POLYLINE", "MESH"):
                 from ezdxf import explode
@@ -164,10 +153,6 @@ def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol
     return np.asarray(verts, dtype=float), np.asarray(faces, dtype=np.int64)
 
 def load_mesh_from_dxf_robust(dxf_path:str, thickness:Optional[float], layer_regex:Optional[str], dedup_tol:float)->trimesh.Trimesh:
-    """
-    (A) Parser ezdxf → malla; si falla, (B) trimesh.load(force='mesh').
-    thickness: si no hay malla 3D y existen perfiles 2D, extruye (requiere shapely).
-    """
     if HAS_EZDXF:
         try:
             V,F = _collect_faces_ezdxf(dxf_path, layer_regex=layer_regex, dedup_tol=dedup_tol)
@@ -178,14 +163,12 @@ def load_mesh_from_dxf_robust(dxf_path:str, thickness:Optional[float], layer_reg
         except Exception as e:
             st.info(f"Parser ezdxf falló, probando fallback trimesh: {e}")
 
-    # Fallback con trimesh
     geom = trimesh.load(dxf_path, force='mesh')
     if isinstance(geom, trimesh.Scene):
         meshes = [g for g in geom.geometry.values() if isinstance(g, trimesh.Trimesh)]
         if meshes:
             return trimesh.util.concatenate(meshes)
 
-    # ¿2D? → extruir si se pidió
     if thickness and thickness != 0:
         paths_2d = []
         if isinstance(geom, trimesh.Trimesh):
@@ -206,50 +189,38 @@ def load_mesh_from_dxf_robust(dxf_path:str, thickness:Optional[float], layer_reg
 
     raise ValueError("DXF no reconocido como malla ni perfiles 2D.")
 
-# ========= Repair / Split seguro / Volumen / Visual =========
+# ========= Repair / Split seguro / Volumen =========
 def repair_mesh(mesh:trimesh.Trimesh, weld_tol:Optional[float])->trimesh.Trimesh:
-    # Merge de vértices cercano
     try:
         if weld_tol and weld_tol > 0:
             trimesh.repair.merge_vertices(mesh, weld_tol)
     except Exception:
         pass
 
-    # Limpiezas
     for fn in ('remove_duplicate_faces', 'remove_degenerate_faces', 'remove_unreferenced_vertices'):
         try:
             getattr(mesh, fn)()
         except Exception:
             pass
 
-    # Normales y orientación
     try: trimesh.repair.fix_normals(mesh)
     except Exception: pass
     try: trimesh.repair.fix_winding(mesh)
     except Exception: pass
-
-    # Intento de cerrar agujeros
     try: trimesh.repair.fill_holes(mesh)
     except Exception: pass
-
     try: mesh.process()
     except Exception: pass
-
     return mesh
 
 def split_components_safe(mesh: trimesh.Trimesh):
-    """
-    Devuelve [componentes] si el motor de grafos está disponible (networkx/scipy).
-    Si no, devuelve [mesh] para no romper la app.
-    """
     try:
-        # Preferir networkx si está instalado
         return mesh.split(only_watertight=False, engine='networkx')
     except Exception:
         try:
             return mesh.split(only_watertight=False)
         except Exception as e:
-            st.info(f"Split no disponible (falta networkx/scipy). Usando malla completa. Detalle: {e}")
+            st.info(f"Split no disponible. Usando malla completa. Detalle: {e}")
             return [mesh]
 
 def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[float]=None):
@@ -259,7 +230,6 @@ def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[
     vol_voxel_m3 = None
     hull_m3 = None
 
-    # Volumen nativo (si watertight)
     try:
         if wt:
             vol_native = float(mesh.volume)
@@ -267,13 +237,11 @@ def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[
     except Exception:
         wt = False
 
-    # Envolvente convexa
     try:
         hull_m3 = float(mesh.convex_hull.volume) * (to_meters**3)
     except Exception:
         hull_m3 = None
 
-    # Voxelización (aprox para no-watertight)
     if (not wt) and voxel_pitch and voxel_pitch > 0:
         try:
             vg = mesh.voxelized(voxel_pitch)
@@ -294,6 +262,7 @@ def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[
         "hull_m3": hull_m3
     }
 
+# ========= Visualización unificada (sólido + overlays) =========
 def render_mesh_scene(
     mesh: trimesh.Trimesh,
     title: str = "Sólido DXF",
@@ -303,59 +272,62 @@ def render_mesh_scene(
     show_wireframe: bool = False,
     wire_max_segments: int = 20000
 ) -> go.Figure:
-    """
-    Figura con:
-      - Sólido (Mesh3d) SIEMPRE.
-      - Wireframe opcional (Scatter3d) superpuesto.
-      - Ejes XYZ opcionales.
-    """
     V, F = mesh.vertices, mesh.faces
     fig = go.Figure()
 
     # --- Sólido siempre ---
-    if F is not None and len(F) > 0:
-        fig.add_trace(go.Mesh3d(
-            x=V[:, 0], y=V[:, 1], z=V[:, 2],
-            i=F[:, 0], j=F[:, 1], k=F[:, 2],
-            color="#4d88ff", opacity=float(opacity), flatshading=True,
-            lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2),
-            name="Sólido"
-        ))
-    else:
-        hull = mesh.convex_hull
-        HV, HF = hull.vertices, hull.faces
-        fig.add_trace(go.Mesh3d(
-            x=HV[:, 0], y=HV[:, 1], z=HV[:, 2],
-            i=HF[:, 0], j=HF[:, 1], k=HF[:, 2],
-            color="#4d88ff", opacity=float(opacity), flatshading=True,
-            lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2),
-            name="Hull (fallback)"
-        ))
+    try:
+        if F is not None and len(F) > 0:
+            fig.add_trace(go.Mesh3d(
+                x=V[:, 0].tolist(), y=V[:, 1].tolist(), z=V[:, 2].tolist(),
+                i=F[:, 0].tolist(), j=F[:, 1].tolist(), k=F[:, 2].tolist(),
+                color="#4d88ff", opacity=float(opacity), flatshading=True,
+                lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2),
+                name="Sólido"
+            ))
+        else:
+            hull = mesh.convex_hull
+            HV, HF = hull.vertices, hull.faces
+            fig.add_trace(go.Mesh3d(
+                x=HV[:, 0].tolist(), y=HV[:, 1].tolist(), z=HV[:, 2].tolist(),
+                i=HF[:, 0].tolist(), j=HF[:, 1].tolist(), k=HF[:, 2].tolist(),
+                color="#4d88ff", opacity=float(opacity), flatshading=True,
+                lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2),
+                name="Hull (fallback)"
+            ))
+    except Exception as e:
+        # Si falla el Mesh3d, mostramos el error y seguimos con lo que se pueda
+        st.error("Error generando el sólido (Mesh3d).")
+        st.code(traceback.format_exc())
 
     # --- Wireframe opcional ---
     if show_wireframe:
-        edges = mesh.edges_unique
-        if wire_max_segments and len(edges) > wire_max_segments:
-            idx = np.random.choice(len(edges), size=wire_max_segments, replace=False)
-            edges = edges[idx]
-        segs = mesh.vertices[edges].reshape(-1, 2, 3)
-        xs = segs[:, :, 0].ravel(order="C")
-        ys = segs[:, :, 1].ravel(order="C")
-        zs = segs[:, :, 2].ravel(order="C")
-        n = len(segs)
-        xw = np.empty(n*3, dtype=float); yw = np.empty(n*3, dtype=float); zw = np.empty(n*3, dtype=float)
-        xw[0::3] = xs[0::2]; xw[1::3] = xs[1::2]; xw[2::3] = np.nan
-        yw[0::3] = ys[0::2]; yw[1::3] = ys[1::2]; yw[2::3] = np.nan
-        zw[0::3] = zs[0::2]; zw[1::3] = zs[1::2]; zw[2::3] = np.nan
+        try:
+            edges = mesh.edges_unique
+            if wire_max_segments and len(edges) > wire_max_segments:
+                idx = np.random.choice(len(edges), size=wire_max_segments, replace=False)
+                edges = edges[idx]
+            segs = mesh.vertices[edges].reshape(-1, 2, 3)
+            xs = segs[:, :, 0].ravel(order="C")
+            ys = segs[:, :, 1].ravel(order="C")
+            zs = segs[:, :, 2].ravel(order="C")
+            n = len(segs)
+            xw = np.empty(n*3, dtype=float); yw = np.empty(n*3, dtype=float); zw = np.empty(n*3, dtype=float)
+            xw[0::3] = xs[0::2]; xw[1::3] = xs[1::2]; xw[2::3] = np.nan
+            yw[0::3] = ys[0::2]; yw[1::3] = ys[1::2]; yw[2::3] = np.nan
+            zw[0::3] = zs[0::2]; zw[1::3] = zs[1::2]; zw[2::3] = np.nan
 
-        fig.add_trace(go.Scatter3d(
-            x=xw, y=yw, z=zw, mode="lines",
-            line=dict(color="gray", width=2),
-            name="Wireframe", showlegend=True
-        ))
+            fig.add_trace(go.Scatter3d(
+                x=xw.tolist(), y=yw.tolist(), z=zw.tolist(), mode="lines",
+                line=dict(color="gray", width=2),
+                name="Wireframe", showlegend=True
+            ))
+        except Exception:
+            st.info("Wireframe no disponible para este modelo.")
+            st.code(traceback.format_exc())
 
     # --- Ejes XYZ opcionales ---
-    if show_axes:
+    if show_axes and V.size:
         extent = float(np.ptp(V, axis=0).max()) if V.size else 1.0
         fig.add_trace(go.Scatter3d(x=[0, extent], y=[0, 0], z=[0, 0], mode="lines",
                                    line=dict(color="red", width=3), name="Eje X", showlegend=False))
@@ -364,7 +336,6 @@ def render_mesh_scene(
         fig.add_trace(go.Scatter3d(x=[0, 0], y=[0, 0], z=[0, extent], mode="lines",
                                    line=dict(color="blue", width=3), name="Eje Z", showlegend=False))
 
-    # --- Layout y cámara ---
     fig.update_layout(
         title=title,
         scene=dict(aspectmode="data"),
@@ -412,11 +383,9 @@ with tempfile.TemporaryDirectory() as tmpdir:
     tmp_path = os.path.join(tmpdir, uploaded.name)
     with open(tmp_path, "wb") as f: f.write(uploaded.read())
 
-    # Unidades
     unit_name, to_meters = read_insunits(tmp_path, None if assume_units=="(auto)" else assume_units)
     st.write(f"**Unidades DXF:** `{unit_name}` (1 {unit_name} = {to_meters} m)")
 
-    # Carga robusta
     try:
         mesh = load_mesh_from_dxf_robust(
             tmp_path,
@@ -426,17 +395,17 @@ with tempfile.TemporaryDirectory() as tmpdir:
         )
     except Exception as e:
         st.error(f"Error al cargar el DXF (parser robusto + fallback): {e}")
+        st.code(traceback.format_exc())
         st.stop()
 
-    # Reparación
     mesh = repair_mesh(mesh, weld_tol=(weld_tol if weld_tol>0 else None))
 
-    # Componentes (split seguro) y selección del principal
+    # Split seguro y componente principal
     parts = split_components_safe(mesh)
     main = parts[0] if len(parts) else mesh
+
     st.write({"componentes": len(parts), "vertices_main": int(len(main.vertices)), "faces_main": int(len(main.faces))})
 
-    # Volúmenes
     vols = compute_volumes(main, to_meters, voxel_pitch=(voxel_pitch if voxel_pitch>0 else None))
     cubic = cubic_suffix(unit_name)
 
@@ -457,26 +426,31 @@ with tempfile.TemporaryDirectory() as tmpdir:
         if vols["hull_m3"] is not None:
             st.info(f"Envolvente convexa (m³): `{vols['hull_m3']:,.6f}` (sobre-estima)")
 
-    # Visualización SIEMPRE con sólido + overlays en el mismo gráfico
-    st.info("Renderizando sólido en 3D…")
-    mesh_view = main.copy()
-    if simplify_for_view and mesh_view.faces.shape[0] > target_faces:
-        step = max(int(mesh_view.faces.shape[0] / target_faces), 1)
-        mesh_view.update_faces(np.arange(0, mesh_view.faces.shape[0], step))
-        mesh_view.remove_unreferenced_vertices()
-        if mesh_view.faces.shape[0] == 0:
-            mesh_view = main.copy()
+    # Visualización SIEMPRE con sólido (spinner + manejo de errores)
+    st.markdown("### Visualización 3D")
+    try:
+        mesh_view = main.copy()
+        if simplify_for_view and mesh_view.faces.shape[0] > target_faces:
+            step = max(int(mesh_view.faces.shape[0] / target_faces), 1)
+            mesh_view.update_faces(np.arange(0, mesh_view.faces.shape[0], step))
+            mesh_view.remove_unreferenced_vertices()
+            if mesh_view.faces.shape[0] == 0:
+                mesh_view = main.copy()
 
-    fig = render_mesh_scene(
-        mesh_view,
-        title=os.path.basename(uploaded.name),
-        opacity=opacity,
-        show_axes=show_axes,
-        camera=camera,
-        show_wireframe=show_wireframe,
-        wire_max_segments=20000
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        with st.spinner("Renderizando sólido en 3D…"):
+            fig = render_mesh_scene(
+                mesh_view,
+                title=os.path.basename(uploaded.name),
+                opacity=opacity,
+                show_axes=show_axes,
+                camera=camera,
+                show_wireframe=show_wireframe,
+                wire_max_segments=20000
+            )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error("Ocurrió un error al renderizar el sólido.")
+        st.code(traceback.format_exc())
 
     # Exportaciones
     st.markdown("### Exportar")
