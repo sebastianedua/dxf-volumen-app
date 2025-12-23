@@ -104,3 +104,9 @@ wcwidth==0.2.14
 webcolors==25.10.0
 webencodings==0.5.1
 websocket-client==1.9.0
+streamlit>=1.39
+ezdxf>=1.2.0
+trimesh>=4.3.0
+numpy>=1.26
+plotly>=5.24
+shapely>=2.0
