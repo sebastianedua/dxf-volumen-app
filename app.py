@@ -225,7 +225,7 @@ def render_mesh_scene(mesh: trimesh.Trimesh, title: str, opacity: float = 0.9, s
 # --- UI mínima ---
 st.set_page_config(page_title="DXF → Sólido 3D y Volumen (m³)", layout="wide")
 st.title("DXF → Sólido 3D y Volumen (m³)")
-st.caption("Sube tu DXF, elige si ver wireframe y presiona **Calcular**.")
+st.caption("Sube tu DXF, elige si ver wireframe y presiona **Calcular**. Herramienta creada por Sebastián Zúñiga Leyton")
 
 uploaded = st.file_uploader("Sube tu DXF", type=["dxf"])
 show_wireframe = st.checkbox("Wireframe (superponer)", value=True)  # activado por defecto
