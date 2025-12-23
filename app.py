@@ -1,354 +1,449 @@
 
 # -*- coding: utf-8 -*-
 """
-DXF → Sólido 3D y Volumen (robusto y mínimo-invasivo)
+DXF → Sólido 3D y Volumen (robusto, con voxelización y visual mejorada)
 
-- Carga DXF con ezdxf (prioriza 3DFACE; hooks tolerantes para MESH/POLYFACE).
-- Convierte cualquier entrada (dict/(V,F)/Trimesh) a trimesh.Trimesh.
-- Repara malla, selecciona componente mayor, calcula y muestra volumen SIEMPRE.
-- Visualiza en 3D con Plotly.
+- Carga DXF con ezdxf (3DFACE/POLYFACE/MESH via virtual_entities).
+- Dedup de vértices con tolerancia configurable.
+- Repara malla, selecciona componente mayor, intenta cerrar agujeros.
+- Calcula volumen:
+    * Nativo si watertight (confiable).
+    * Aproximado por voxelización si no watertight (pitch configurable).
+    * Envolvente convexa como referencia (sobre-estima).
+- Visualiza en 3D con Plotly (wireframe, opacidad, ejes, cámara).
 - Exporta STL y reporte TXT.
 
 Autor original: Sebastián Zúñiga Leyton
 Ajustes: M365 Copilot
 """
 
-import io
-import os
+import os, io, tempfile
+from typing import Optional, Tuple, List
 import numpy as np
 import streamlit as st
-import tempfile
-import trimesh
 import plotly.graph_objects as go
-import ezdxf
+import trimesh
 
-# -------------------- Utilidades de conversión y reparación --------------------
+# Dependencia opcional: ezdxf
+try:
+    import ezdxf
+    HAS_EZDXF = True
+except Exception:
+    HAS_EZDXF = False
 
-def to_trimesh_safe(mesh_like):
-    """Convierte dict/(V,F)/Trimesh a trimesh.Trimesh de forma segura."""
-    if isinstance(mesh_like, trimesh.Trimesh):
-        return mesh_like
-    if isinstance(mesh_like, dict) and 'vertices' in mesh_like and 'faces' in mesh_like:
-        return trimesh.Trimesh(
-            vertices=np.asarray(mesh_like['vertices'], dtype=float),
-            faces=np.asarray(mesh_like['faces'], dtype=np.int64),
-            process=False
-        )
-    if isinstance(mesh_like, (tuple, list)) and len(mesh_like) == 2:
-        v, f = mesh_like
-        return trimesh.Trimesh(
-            vertices=np.asarray(v, dtype=float),
-            faces=np.asarray(f, dtype=np.int64),
-            process=False
-        )
-    raise TypeError(f"Formato inesperado de malla: {type(mesh_like)}")
+# ========= Unidades (INSUNITS) =========
+UNITS_MAP = {
+    0: ("unitless", 1.0), 1: ("in", 0.0254), 2: ("ft", 0.3048), 3: ("mi", 1609.344),
+    4: ("mm", 1e-3), 5: ("cm", 1e-2), 6: ("m", 1.0), 7: ("km", 1000.0),
+    8: ("uin", 0.0254e-6), 9: ("mil", 25.4e-6), 10: ("yd", 0.9144),
+    11: ("Å", 1e-10), 12: ("nm", 1e-9), 13: ("µm", 1e-6), 14: ("dm", 0.1),
+    15: ("dam", 10.0), 16: ("hm", 100.0), 17: ("Gm", 1e9), 18: ("AU", 1.495978707e11),
+    19: ("ly", 9.460730472e15), 20: ("pc", 3.085677581e16),
+}
+ASSUME_NAME_TO_METERS = {
+    "unitless":1.0, "m":1.0, "meter":1.0, "meters":1.0, "mm":1e-3, "millimeter":1e-3,
+    "millimeters":1e-3, "cm":1e-2, "centimeter":1e-2, "centimeters":1e-2,
+    "dm":1e-1, "in":0.0254, "inch":0.0254, "inches":0.0254, "ft":0.3048, "feet":0.3048,
+    "yd":0.9144, "yard":0.9144, "km":1000.0,
+}
 
-def pick_largest_component(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Devuelve el componente conectado con más caras (representativo)."""
+def cubic_suffix(u:str)->str:
+    m={"unitless":"u³","in":"in³","ft":"ft³","mi":"mi³","mm":"mm³","cm":"cm³","m":"m³",
+       "km":"km³","yd":"yd³","Å":"Å³","nm":"nm³","µm":"µm³","dm":"dm³","dam":"dam³",
+       "hm":"hm³","Gm":"Gm³","AU":"AU³","ly":"ly³","pc":"pc³","uin":"uin³","mil":"mil³"}
+    return m.get(u,f"{u}³")
+
+def read_insunits(dxf_path:str, assume_units:Optional[str])->Tuple[str,float]:
+    if assume_units:
+        u=assume_units.strip().lower()
+        return (u, ASSUME_NAME_TO_METERS.get(u,1.0)) if u in ASSUME_NAME_TO_METERS else ("unitless",1.0)
+    if not HAS_EZDXF:
+        return "unitless",1.0
     try:
-        comps = mesh.split(only_watertight=False)
-        return max(comps, key=lambda m: len(m.faces)) if comps else mesh
+        doc=ezdxf.readfile(dxf_path)
+        code=doc.header.get("$INSUNITS",0)
+        return UNITS_MAP.get(code,("unitless",1.0))
     except Exception:
-        return mesh
+        return "unitless",1.0
 
-def repair_mesh(mesh_like, weld_tol: float | None = None) -> trimesh.Trimesh:
+# ========= Carga robusta desde DXF con ezdxf =========
+def _collect_faces_ezdxf(dxf_path:str, layer_regex:Optional[str]=None, dedup_tol:float=1e-6):
     """
-    Conversión + reparaciones básicas. Mantiene tu firma y comportamiento.
+    Devuelve listas (verts, faces) desde 3DFACE (y derivados) usando ezdxf.
+    Aplica virtual_entities() para desanidar INSERT/BLOCK. Dedup con tolerancia.
     """
-    mesh = to_trimesh_safe(mesh_like)
+    import re
+    doc = ezdxf.readfile(dxf_path)
+    msp = doc.modelspace()
+    layer_ok = (lambda layer: True)
+    if layer_regex:
+        rx = re.compile(layer_regex, flags=re.IGNORECASE)
+        layer_ok = lambda layer: bool(rx.search(layer or ""))
 
-    # Soldar vértices si hay tolerancia > 0
-    if weld_tol is not None and weld_tol > 0:
+    verts: List[Tuple[float,float,float]] = []
+    faces: List[Tuple[int,int,int]] = []
+    # hash por grid snapping para agrupar cercanos
+    vmap = {}  # key -> index
+
+    def add_vertex(v):
+        # tolerancia (en unidades DXF)
+        q = max(float(dedup_tol), 1e-12)
+        k = (round(v.x/q), round(v.y/q), round(v.z/q))
+        idx = vmap.get(k)
+        if idx is None:
+            idx = len(verts)
+            verts.append((float(v.x), float(v.y), float(v.z)))
+            vmap[k] = idx
+        return idx
+
+    def add_triangle(a,b,c):
+        # descartar triángulos degenerados
+        va=np.array(verts[a]); vb=np.array(verts[b]); vc=np.array(verts[c])
+        if np.linalg.norm(np.cross(vb-va, vc-va)) < 1e-16:
+            return
+        faces.append((a,b,c))
+
+    def handle_face3d(face):
         try:
-            trimesh.repair.merge_vertices(mesh, weld_tol)
+            ws = list(face.wcs_vertices())
+        except Exception:
+            ws = [face.dxf.vtx0, face.dxf.vtx1, face.dxf.vtx2, face.dxf.vtx3]
+        pts = [p for p in ws if p is not None]
+        # filtrar puntos consecutivos idénticos
+        uniq = []
+        for p in pts:
+            if not uniq or (p != uniq[-1]):
+                uniq.append(p)
+        if len(uniq) < 3:
+            return
+        if len(uniq) == 3:
+            i0=add_vertex(uniq[0]); i1=add_vertex(uniq[1]); i2=add_vertex(uniq[2])
+            add_triangle(i0,i1,i2); return
+        if len(uniq) >= 4:
+            i0=add_vertex(uniq[0]); i1=add_vertex(uniq[1]); i2=add_vertex(uniq[2]); i3=add_vertex(uniq[3])
+            add_triangle(i0,i1,i2)
+            add_triangle(i0,i2,i3)
+
+    for e in msp:
+        try:
+            layer = e.dxf.layer
+        except Exception:
+            layer = ""
+        if not layer_ok(layer):
+            continue
+
+        processed = False
+        # intentar virtual_entities
+        try:
+            for ve in e.virtual_entities():
+                if ve.dxftype() == "3DFACE":
+                    handle_face3d(ve)
+                    processed = True
+        except Exception:
+            pass
+        if processed:
+            continue
+
+        # 3DFACE directo
+        try:
+            if e.dxftype() == "3DFACE":
+                handle_face3d(e)
+                continue
         except Exception:
             pass
 
-    # Limpiezas tolerantes a errores
+        # Fallback: explotar a 3DFACE
+        try:
+            if e.dxftype() in ("POLYFACE", "POLYLINE", "MESH"):
+                from ezdxf import explode
+                tmp = list(explode.virtual_entities(e))
+                for ve in tmp:
+                    if ve.dxftype() == "3DFACE":
+                        handle_face3d(ve)
+                continue
+        except Exception:
+            pass
+
+    return np.asarray(verts, dtype=float), np.asarray(faces, dtype=np.int64)
+
+def load_mesh_from_dxf_robust(dxf_path:str, thickness:Optional[float], layer_regex:Optional[str], dedup_tol:float)->trimesh.Trimesh:
+    """
+    (A) Parser ezdxf → malla; si falla, (B) trimesh.load(force='mesh').
+    thickness: si no hay malla 3D y existen perfiles 2D, extruye (requiere shapely).
+    """
+    if HAS_EZDXF:
+        try:
+            V,F = _collect_faces_ezdxf(dxf_path, layer_regex=layer_regex, dedup_tol=dedup_tol)
+            if V.size and F.size:
+                mesh = trimesh.Trimesh(vertices=V, faces=F, process=False)
+                if not mesh.is_empty:
+                    return mesh
+        except Exception as e:
+            st.info(f"Parser ezdxf falló, probando fallback trimesh: {e}")
+
+    # Fallback con trimesh
+    geom = trimesh.load(dxf_path, force='mesh')
+    if isinstance(geom, trimesh.Scene):
+        meshes = [g for g in geom.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if meshes:
+            return trimesh.util.concatenate(meshes)
+
+    # ¿2D? → extruir si se pidió
+    if thickness and thickness != 0:
+        paths_2d = []
+        if isinstance(geom, trimesh.Trimesh):
+            pass
+        elif hasattr(geom, "geometry"):
+            paths_2d = [g for g in geom.geometry.values() if hasattr(g, "polygons_full")]
+        elif hasattr(geom, "polygons_full"):
+            paths_2d = [geom]
+        polygons=[]
+        for p in paths_2d: polygons.extend(p.polygons_full)
+        if polygons:
+            from shapely.ops import unary_union
+            merged = unary_union(polygons)
+            return trimesh.creation.extrude_polygon(merged, height=float(thickness))
+
+    if isinstance(geom, trimesh.Trimesh):
+        return geom
+
+    raise ValueError("DXF no reconocido como malla ni perfiles 2D.")
+
+# ========= Repair / Volumen / Plot =========
+def repair_mesh(mesh:trimesh.Trimesh, weld_tol:Optional[float])->trimesh.Trimesh:
+    # Merge de vértices cercano
+    try:
+        if weld_tol and weld_tol > 0:
+            trimesh.repair.merge_vertices(mesh, weld_tol)
+    except Exception:
+        pass
+
+    # Limpiezas
     for fn in ('remove_duplicate_faces', 'remove_degenerate_faces', 'remove_unreferenced_vertices'):
         try:
             getattr(mesh, fn)()
         except Exception:
             pass
 
-    # Normales y procesado
+    # Normales y orientación
     try: trimesh.repair.fix_normals(mesh)
     except Exception: pass
+    try: trimesh.repair.fix_winding(mesh)
+    except Exception: pass
+
+    # Intento de cerrar agujeros
+    try: trimesh.repair.fill_holes(mesh)
+    except Exception: pass
+
+    # Seleccionar componente mayor para evitar fragmentos
+    try:
+        parts = mesh.split(only_watertight=False)
+        if len(parts) > 1:
+            parts = sorted(parts, key=lambda m: (len(m.faces), m.bounding_box_oriented.volume if m.vertices.size else 0), reverse=True)
+            mesh = parts[0]
+    except Exception:
+        pass
+
     try: mesh.process()
     except Exception: pass
 
     return mesh
 
-def compute_volume_safe(mesh: trimesh.Trimesh, try_fill_holes: bool = True):
-    """
-    Calcula volumen de forma robusta y devuelve (volumen, estado, nota).
-    estado: 'ok' | 'approx' | 'error'
-    """
+def compute_volumes(mesh:trimesh.Trimesh, to_meters:float, voxel_pitch:Optional[float]=None):
+    wt = bool(mesh.is_watertight)
+    vol_native = None
+    vol_m3 = None
+    vol_voxel_m3 = None
+    hull_m3 = None
+
+    # Volumen nativo (si watertight)
     try:
-        m = pick_largest_component(mesh.copy())
+        if wt:
+            vol_native = float(mesh.volume)
+            vol_m3 = vol_native * (to_meters**3)
+    except Exception:
+        wt = False
 
-        # Limpiezas suaves
-        for fn in ('remove_degenerate_faces', 'remove_duplicate_faces', 'remove_unreferenced_vertices'):
-            try:
-                getattr(m, fn)()
-            except Exception:
-                pass
+    # Envolvente convexa
+    try:
+        hull_m3 = float(mesh.convex_hull.volume) * (to_meters**3)
+    except Exception:
+        hull_m3 = None
 
-        # Normales y procesado
-        try: trimesh.repair.fix_normals(m)
-        except Exception: pass
-        try: m.process()
-        except Exception: pass
-
-        # Intentar cerrar agujeros (opcional)
-        if try_fill_holes and not m.is_watertight:
-            try:
-                trimesh.repair.fill_holes(m)
-                m.process()
-            except Exception:
-                pass
-
-        # Volumen
-        if m.is_watertight:
-            return float(m.volume), 'ok', 'Malla watertight: volumen confiable.'
-        else:
-            # Volumen aproximado (puede ser inexacto)
-            try:
-                vol = float(m.volume)
-                return vol, 'approx', 'Malla no watertight: volumen aproximado (podría ser inexacto).'
-            except Exception:
-                # Fallback: envolvente convexa (sobre-estima)
-                try:
-                    hull = m.convex_hull
-                    return float(hull.volume), 'approx', 'Usando envolvente convexa como aproximación (sobre-estima).'
-                except Exception:
-                    return None, 'error', 'No fue posible calcular el volumen (malla abierta o degenerada).'
-    except Exception as e:
-        return None, 'error', f'Error inesperado: {e}'
-
-# -------------------- Parseo DXF (3DFACE + hooks tolerantes) --------------------
-
-def dxf_to_mesh_data(dxf_path: str):
-    """
-    Convierte entidades 3DFACE de un DXF a (vertices, faces).
-    Incluye hooks tolerantes para MESH y POLYFACE (si el DXF lo permite).
-    """
-    doc = ezdxf.readfile(dxf_path)
-    msp = doc.modelspace()
-
-    vertices: list[list[float]] = []
-    faces: list[list[int]] = []
-
-    def get_index(v: np.ndarray, table: list[list[float]], atol=1e-9):
-        # Busca si un vértice igual (aprox) existe; si no, lo agrega.
-        for i, t in enumerate(table):
-            if np.allclose(v, t, atol=atol):
-                return i
-        table.append([float(v[0]), float(v[1]), float(v[2])])
-        return len(table) - 1
-
-    # --- 3DFACE ---
-    count_3dface = 0
-    for e in msp.query("3DFACE"):
-        v0 = np.array(e.dxf.vtx0, dtype=float)
-        v1 = np.array(e.dxf.vtx1, dtype=float)
-        v2 = np.array(e.dxf.vtx2, dtype=float)
-        v3 = np.array(e.dxf.vtx3, dtype=float) if hasattr(e.dxf, "vtx3") else v2
-
-        idx = [get_index(v0, vertices), get_index(v1, vertices), get_index(v2, vertices)]
-        faces.append(idx)
-        count_3dface += 1
-
-        if not np.allclose(v3, v2):
-            idx2 = [get_index(v0, vertices), get_index(v2, vertices), get_index(v3, vertices)]
-            faces.append(idx2)
-
-    # --- Hooks simples para MESH ---
-    count_mesh = 0
-    for e in msp.query("MESH"):
+    # Voxelización (aprox para no-watertight)
+    if (not wt) and voxel_pitch and voxel_pitch > 0:
         try:
-            vs = np.asarray(e.vertices, dtype=float)
-            fs = np.asarray(e.faces, dtype=np.int64)
-            if vs.size > 0 and fs.size > 0:
-                base = len(vertices)
-                for v in vs:
-                    vertices.append([float(v[0]), float(v[1]), float(v[2])])
-                for f in fs:
-                    faces.append([int(base + f[0]), int(base + f[1]), int(base + f[2])])
-                count_mesh += 1
+            vg = mesh.voxelized(voxel_pitch)  # VoxelGrid
+            # VoxelGrid no siempre expone .volume; estimamos por número de celdas llenas * pitch^3
+            filled = getattr(vg, 'filled_count', None)
+            if filled is None:
+                # fallback: contar ocupación por matriz
+                mat = vg.matrix if hasattr(vg, 'matrix') else None
+                filled = int(np.count_nonzero(mat)) if mat is not None else None
+            if filled is not None:
+                vol_voxel_m3 = float(filled) * float(voxel_pitch**3) * (to_meters**3)
         except Exception:
-            pass
+            vol_voxel_m3 = None
 
-    # --- Hooks simples para POLYFACE (dependiente de DXF) ---
-    count_polyface = 0
-    for pl in msp.query("POLYLINE"):
-        try:
-            if hasattr(pl, "is_poly_face_mesh") and pl.is_poly_face_mesh:
-                vlist = []
-                flist = []
-                for v in pl.vertices():
-                    if hasattr(v, "is_face_record") and v.is_face_record:
-                        idxs = [v.dxf.vtx0, v.dxf.vtx1, v.dxf.vtx2, v.dxf.vtx3]
-                        idxs = [i for i in idxs if i not in (0, None)]
-                        if len(idxs) >= 3:
-                            flist.append(idxs[:3])
-                    else:
-                        loc = np.array(v.dxf.location, dtype=float)
-                        vlist.append([float(loc[0]), float(loc[1]), float(loc[2])])
-
-                if len(vlist) > 0 and len(flist) > 0:
-                    base = len(vertices)
-                    vertices.extend(vlist)
-                    for f in flist:  # 1-based → 0-based
-                        faces.append([base + (int(i) - 1) for i in f[:3]])
-                    count_polyface += 1
-        except Exception:
-            pass
-
-    vertices = np.asarray(vertices, dtype=float)
-    faces = np.asarray(faces, dtype=np.int64)
-
-    meta = {
-        "count_3dface": count_3dface,
-        "count_mesh": count_mesh,
-        "count_polyface": count_polyface,
-        "total_vertices": int(len(vertices)),
-        "total_faces": int(len(faces))
+    return {
+        "wt": wt,
+        "vol_native": vol_native,
+        "vol_m3": vol_m3,
+        "vol_voxel_m3": vol_voxel_m3,
+        "hull_m3": hull_m3
     }
-    return vertices, faces, meta
 
-# -------------------- App Streamlit --------------------
-
-st.set_page_config(page_title="DXF → Volumen 3D", layout="wide")
-st.title("DXF → Sólido 3D y Volumen")
-
-st.markdown(
-    "Sube un **DXF** con entidades 3D (idealmente `3DFACE`). "
-    "La app convertirá a malla, intentará repararla, mostrará la vista 3D y calculará el volumen."
-)
-
-uploaded = st.file_uploader("Sube tu archivo DXF", type=["dxf"])
-
-col_opts = st.columns(4)
-with col_opts[0]:
-    weld_tol = st.number_input("Tolerancia de soldadura (unidades DXF)", min_value=0.0, value=0.0, step=0.001, format="%.6f")
-with col_opts[1]:
-    scale = st.number_input("Factor de escala (ej: mm→m = 0.001)", min_value=0.0, value=1.0, step=0.001, format="%.6f")
-with col_opts[2]:
-    try_fill_holes = st.checkbox("Intentar cerrar agujeros (fill_holes)", value=True)
-with col_opts[3]:
-    show_wireframe = st.checkbox("Wireframe", value=False)
-
-mesh_opacity = st.slider("Opacidad de la malla", 0.1, 1.0, 0.6, 0.05)
-
-if uploaded is not None:
-    try:
-        # Guardar a archivo temporal para ezdxf
-        with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
-            tmp.write(uploaded.read())
-            dxf_path = tmp.name
-
-        st.info("Leyendo DXF…")
-        vertices, faces, meta = dxf_to_mesh_data(dxf_path)
-
-        if len(vertices) == 0 or len(faces) == 0:
-            st.error("No se encontraron caras triangulables. Necesitas entidades 3D (ej. `3DFACE`).")
-            st.stop()
-
-        # Aplicar factor de escala (mm→m, etc.)
-        if scale > 0 and scale != 1.0:
-            vertices = vertices * float(scale)
-
-        st.write("Resumen DXF:", meta)
-
-        # Reparación mínima (mantiene tu flujo)
-        st.info("Reparando malla…")
-        mesh = repair_mesh((vertices, faces), weld_tol=(weld_tol if weld_tol > 0 else None))
-
-        # Cálculo robusto de volumen (SIEMPRE muestra algo)
-        vol, state, note = compute_volume_safe(mesh, try_fill_holes=try_fill_holes)
-        if vol is not None:
-            if state == 'ok':
-                st.success(f"Volumen: {vol:.6f} u³")
-            else:
-                st.warning(f"Volumen (aprox): {vol:.6f} u³")
-            st.caption(note)
-        else:
-            st.error("No se pudo calcular el volumen.")
-            st.caption(note)
-        vol_text = "n/a" if vol is None else f"{vol:.6f}"
-
-        # Visualización: componente mayor para evitar fragmentos
-        st.info("Renderizando vista 3D…")
-        mesh_draw = pick_largest_component(mesh)
-        x, y, z = mesh_draw.vertices[:, 0], mesh_draw.vertices[:, 1], mesh_draw.vertices[:, 2]
-        i, j, k = mesh_draw.faces[:, 0], mesh_draw.faces[:, 1], mesh_draw.faces[:, 2]
-
-        data = [
-            go.Mesh3d(
-                x=x, y=y, z=z, i=i, j=j, k=k,
-                opacity=float(mesh_opacity), color="lightskyblue", name="Malla"
-            )
+def plot_trimesh(mesh:trimesh.Trimesh, title="Sólido DXF", opacity=0.85, show_axes=True, camera='data')->go.Figure:
+    V,F=mesh.vertices, mesh.faces
+    fig = go.Figure([
+        go.Mesh3d(
+            x=V[:,0], y=V[:,1], z=V[:,2], i=F[:,0], j=F[:,1], k=F[:,2],
+            color="#4d88ff", opacity=float(opacity), flatshading=True,
+            lighting=dict(ambient=0.6, diffuse=0.8, specular=0.2)
+        )
+    ])
+    if show_axes:
+        # Ejes simples en el origen
+        axes_len = float(np.ptp(V, axis=0).max()) if V.size else 1.0
+        ax = [
+            go.Scatter3d(x=[0, axes_len], y=[0,0], z=[0,0], mode="lines", line=dict(color="red", width=3), name="X"),
+            go.Scatter3d(x=[0,0], y=[0, axes_len], z=[0,0], mode="lines", line=dict(color="green", width=3), name="Y"),
+            go.Scatter3d(x=[0,0], y=[0,0], z=[0, axes_len], mode="lines", line=dict(color="blue", width=3), name="Z"),
         ]
-        if show_wireframe:
-            edges = mesh_draw.edges_unique
-            ex = mesh_draw.vertices[edges].reshape(-1, 2, 3)
-            for seg in ex:
-                data.append(
-                    go.Scatter3d(
-                        x=seg[:, 0], y=seg[:, 1], z=seg[:, 2],
-                        mode="lines", line=dict(color="gray", width=1),
-                        name="Wireframe", showlegend=False
-                    )
-                )
+        for a in ax: fig.add_trace(a)
 
-        fig = go.Figure(data=data)
-        fig.update_layout(scene=dict(aspectmode="data"),
-                          margin=dict(l=0, r=0, t=30, b=0),
-                          title="Malla 3D (componente mayor)")
-        st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        title=title,
+        scene=dict(aspectmode="data"),
+        margin=dict(l=0,r=0,t=36,b=0)
+    )
+    if camera == 'xy':
+        fig.update_layout(scene_camera=dict(eye=dict(x=0., y=0., z=2.5)))
+    elif camera == 'xz':
+        fig.update_layout(scene_camera=dict(eye=dict(x=0., y=2.5, z=0.)))
+    elif camera == 'yz':
+        fig.update_layout(scene_camera=dict(eye=dict(x=2.5, y=0., z=0.)))
+    else:
+        fig.update_layout(scene_camera=dict(eye=dict(x=1.5, y=1.5, z=1.5)))
+    return fig
 
-        # Diagnóstico breve
-        st.write({
-            "n_vertices": int(len(mesh.vertices)),
-            "n_faces": int(len(mesh.faces)),
-            "watertight": bool(mesh.is_watertight)
-        })
+# ========= UI =========
+st.set_page_config(page_title="DXF → Sólido y Volumen (robusto)", layout="wide")
+st.title("DXF → Sólido 3D y Volumen")
+st.subheader("Conversión robusta de DXF a sólido y cálculo de volumen — Herramienta creada por Sebastián Zúñiga Leyton")
 
-        # Exportaciones
-        c1, c2 = st.columns(2)
-        with c1:
-            try:
-                stl_bytes = mesh.export(file_type="stl")
-                st.download_button("Descargar STL", data=stl_bytes,
-                                   file_name="malla.stl", mime="application/octet-stream")
-            except Exception:
-                st.error("No se pudo exportar STL.")
-        with c2:
-            reporte = io.StringIO()
-            reporte.write("=== REPORTE MALLA DXF ===\n")
-            reporte.write(f"Vertices: {len(mesh.vertices)}\n")
-            reporte.write(f"Faces: {len(mesh.faces)}\n")
-            reporte.write(f"Watertight: {mesh.is_watertight}\n")
-            reporte.write(f"Volumen (u³): {vol_text}\n")
-            reporte.write("\n--- Meta DXF ---\n")
-            for k, v in meta.items():
-                reporte.write(f"{k}: {v}\n")
-            st.download_button("Descargar reporte TXT",
-                               data=reporte.getvalue(),
-                               file_name="reporte.txt", mime="text/plain")
+with st.sidebar:
+    st.header("Parámetros")
+    assume_units = st.selectbox("Asumir unidades (si el DXF no trae $INSUNITS):",
+        ["(auto)","mm","cm","m","in","ft","unitless"], index=0)
+    layer_regex = st.text_input("Filtro por capa (regex opcional)", value="")
+    dedup_tol = st.number_input("Tolerancia de deduplicado (unidades DXF)", min_value=0.0, value=1e-6, step=1e-6, format="%.9f")
+    weld_tol = st.number_input("Tolerancia de soldado (unidades DXF)", min_value=0.0, value=0.0, step=0.0001, format="%.6f")
+    thickness = st.number_input("Espesor extrusión (solo si DXF 2D)", min_value=0.0, value=0.0, step=0.1)
+    voxel_pitch = st.number_input("Pitch voxel (aprox volumen si no watertight)", min_value=0.0, value=0.0, step=0.001, format="%.6f")
+    simplify_for_view = st.checkbox("Simplificar solo para visualizar", value=True)
+    target_faces = st.number_input("Caras objetivo visualización", min_value=1000, value=30000, step=1000)
+    opacity = st.slider("Opacidad malla", 0.1, 1.0, 0.85, 0.05)
+    show_axes = st.checkbox("Mostrar ejes XYZ", value=True)
+    camera = st.selectbox("Cámara (vista)", ["data","xy","xz","yz"], index=0)
 
+uploaded = st.file_uploader("Sube tu DXF", type=["dxf"])
+if not uploaded:
+    st.info("📁 Sube un archivo DXF para comenzar.")
+    st.stop()
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    tmp_path = os.path.join(tmpdir, uploaded.name)
+    with open(tmp_path, "wb") as f: f.write(uploaded.read())
+
+    unit_name, to_meters = read_insunits(tmp_path, None if assume_units=="(auto)" else assume_units)
+    st.write(f"**Unidades DXF:** `{unit_name}` (1 {unit_name} = {to_meters} m)")
+
+    # Carga robusta
+    try:
+        mesh = load_mesh_from_dxf_robust(
+            tmp_path,
+            thickness=(thickness if thickness>0 else None),
+            layer_regex=(layer_regex or None),
+            dedup_tol=dedup_tol
+        )
     except Exception as e:
-        import traceback
-        st.error("Ocurrió un error procesando la malla. Detalle debajo o revisa los logs (Manage app → Logs).")
-        st.code(traceback.format_exc())
+        st.error(f"Error al cargar el DXF (parser robusto + fallback): {e}")
         st.stop()
-    finally:
-        # Limpiar el archivo temporal
-        try:
-            if 'dxf_path' in locals() and os.path.exists(dxf_path):
-                os.remove(dxf_path)
-        except Exception:
-            pass
-else:
-    st.info("Carga un archivo DXF para comenzar.")
+
+    # Reparación
+    mesh = repair_mesh(mesh, weld_tol=(weld_tol if weld_tol>0 else None))
+
+    # Métricas
+    parts = mesh.split(only_watertight=False)
+    main = parts[0] if len(parts) else mesh
+    st.write({"componentes": len(parts), "vertices_main": int(len(main.vertices)), "faces_main": int(len(main.faces))})
+
+    # Volúmenes
+    vols = compute_volumes(main, to_meters, voxel_pitch=(voxel_pitch if voxel_pitch>0 else None))
+    cubic = cubic_suffix(unit_name)
+
+    colA,colB,colC,colD = st.columns(4)
+    colA.metric("Vértices", f"{main.vertices.shape[0]:,}")
+    colB.metric("Caras", f"{main.faces.shape[0]:,}")
+    colC.metric("Watertight", "Sí" if vols["wt"] else "No")
+    colD.metric("Volumen (m³)" if vols["wt"] else "Aprox (voxel/convex) m³",
+                f"{(vols['vol_m3'] if vols['wt'] and vols['vol_m3'] is not None else (vols['vol_voxel_m3'] or vols['hull_m3'] or 0.0)):,.6f}")
+
+    st.markdown("### Resultados")
+    if vols["wt"] and vols["vol_native"] is not None:
+        st.success(f"Volumen (nativo): `{vols['vol_native']:,.6f} {cubic}`")
+        st.success(f"Volumen (m³): `{vols['vol_m3']:,.6f} m³`")
+    else:
+        if vols["vol_voxel_m3"] is not None:
+            st.warning(f"Volumen aproximado por voxelización (m³): `{vols['vol_voxel_m3']:,.6f}` (malla abierta)")
+        if vols["hull_m3"] is not None:
+            st.info(f"Envolvente convexa (m³): `{vols['hull_m3']:,.6f}` (sobre-estima)")
+
+    # Visualización (opcionalmente simplificada)
+    mesh_view = main.copy()
+    if simplify_for_view and mesh_view.faces.shape[0] > target_faces:
+        step = max(int(mesh_view.faces.shape[0]/target_faces), 1)
+        mesh_view.update_faces(np.arange(0, mesh_view.faces.shape[0], step))
+        mesh_view.remove_unreferenced_vertices()
+
+    # Wireframe opcional
+    fig = plot_trimesh(mesh_view, title=os.path.basename(uploaded.name), opacity=opacity, show_axes=show_axes, camera=camera)
+    st.plotly_chart(fig, use_container_width=True)
+    if st.checkbox("Mostrar wireframe", value=False):
+        edges = mesh_view.edges_unique
+        ex = mesh_view.vertices[edges].reshape(-1, 2, 3)
+        fig_w = go.Figure([
+            go.Scatter3d(
+                x=seg[:,0], y=seg[:,1], z=seg[:,2],
+                mode="lines", line=dict(color="gray", width=1),
+                name="Wireframe", showlegend=False
+            ) for seg in ex
+        ])
+        fig_w.update_layout(scene=dict(aspectmode="data"), margin=dict(l=0,r=0,t=36,b=0), title="Wireframe")
+        st.plotly_chart(fig_w, use_container_width=True)
+
+    # Exportaciones
+    st.markdown("### Exportar")
+    stl_bytes = io.BytesIO()
+    try:
+        mesh_view.export(stl_bytes, file_type="stl"); stl_bytes.seek(0)
+        st.download_button("⬇️ Descargar STL", stl_bytes, os.path.splitext(uploaded.name)[0]+".stl", "application/sla")
+    except Exception as e:
+        st.info(f"No se pudo generar STL: {e}")
+
+    rep = io.StringIO()
+    rep.write(f"Archivo DXF: {uploaded.name}\n")
+    rep.write(f"Unidades DXF: {unit_name} (1 {unit_name} = {to_meters} m)\n")
+    rep.write(f"Vertices (main): {main.vertices.shape[0]}, Caras (main): {main.faces.shape[0]}\n")
+    rep.write(f"Watertight: {vols['wt']}\n")
+    if vols["wt"] and vols["vol_native"] is not None:
+        rep.write(f"Volumen nativo: {vols['vol_native']:.9f} {cubic}\n")
+        rep.write(f"Volumen m3: {vols['vol_m3']:.9f} m^3\n")
+    else:
+        if vols["vol_voxel_m3"] is not None:
+            rep.write(f"Volumen voxel (m3): {vols['vol_voxel_m3']:.9f}\n")
+        if vols["hull_m3"] is not None:
+            rep.write(f"Convex hull (m3): {vols['hull_m3']:.9f}\n")
+    st.download_button("⬇️ Descargar Reporte TXT", rep.getvalue(),
+                       os.path.splitext(uploaded.name)[0]+"_reporte_volumen.txt", "text/plain")
