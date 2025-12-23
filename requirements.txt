@@ -110,3 +110,13 @@ trimesh>=4.3.0
 numpy>=1.26
 plotly>=5.24
 shapely>=2.0
+
+streamlit>=1.39
+ezdxf>=1.2.0
+trimesh>=4.3.0
+numpy>=1.26
+plotly>=5.24
+shapely>=2.0
+networkx>=3.2
+# opcional:
+scipy>=1.13
